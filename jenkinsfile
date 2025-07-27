@@ -1,0 +1,80 @@
+pipeline {
+    agent any
+
+    environment {
+        // Docker registry (GCR)
+        DOCKER_REGISTRY = 'gcr.io/gke-react-node-project'
+        IMAGE_NAME = 'react-node-app'
+        // Kubernetes namespaces
+        BLUE_NAMESPACE = 'blue'
+        GREEN_NAMESPACE = 'green'
+        // The service to manage traffic
+        SERVICE_NAME = 'react-node-app-service'
+        // Default to blue as the active environment
+        ACTIVE_NAMESPACE = 'blue'
+    }
+
+    stages {
+        stage('Build and Push Docker Image') {
+            steps {
+                script {
+                    sh "docker build -t ${DOCKER_REGISTRY}/${IMAGE_NAME}:${env.BUILD_NUMBER} ."
+                    sh "docker push ${DOCKER_REGISTRY}/${IMAGE_NAME}:${env.BUILD_NUMBER}"
+                }
+            }
+        }
+
+        stage('Deploy to Inactive Environment') {
+            steps {
+                script {
+                    def targetNamespace = env.ACTIVE_NAMESPACE == BLUE_NAMESPACE ? GREEN_NAMESPACE : BLUE_NAMESPACE
+                    
+                    // Apply Kubernetes manifests to the target namespace
+                    sh "kubectl create namespace ${targetNamespace} --dry-run=client -o yaml | kubectl apply -f -"
+                    sh "kubectl apply -f kubernetes/deployment.yaml -n ${targetNamespace} -o yaml --dry-run=client | sed 's|image: .*|image: ${DOCKER_REGISTRY}/${IMAGE_NAME}:${env.BUILD_NUMBER}|' | kubectl apply -f -"
+                    sh "kubectl apply -f kubernetes/service.yaml -n ${targetNamespace}"
+                    
+                    echo "Deployed to the inactive environment: ${targetNamespace}"
+                    env.TARGET_NAMESPACE = targetNamespace
+                }
+            }
+        }
+
+        stage('Manual Validation') {
+            steps {
+                input message: "New version deployed to ${env.TARGET_NAMESPACE}. Is it working? Proceed to switch traffic or cancel to rollback.", ok: 'Proceed'
+            }
+        }
+
+        stage('Switch Traffic to New Environment') {
+            steps {
+                script {
+                    // Update the service to point to the new deployment
+                    sh "kubectl patch svc ${SERVICE_NAME} -p '{\"spec\":{\"selector\":{\"app\": \"react-node-app\",\"environment\": \"${env.TARGET_NAMESPACE}\"}}}' -n default"
+                    echo "Traffic switched to ${env.TARGET_NAMESPACE}."
+                    env.ACTIVE_NAMESPACE = env.TARGET_NAMESPACE
+                }
+            }
+        }
+
+        stage('Cleanup Old Environment') {
+            steps {
+                script {
+                    def oldNamespace = env.ACTIVE_NAMESPACE == BLUE_NAMESPACE ? GREEN_NAMESPACE : BLUE_NAMESPACE
+                    sh "kubectl delete namespace ${oldNamespace}"
+                    echo "Cleaned up old namespace: ${oldNamespace}."
+                }
+            }
+        }
+    }
+    post {
+        failure {
+            script {
+                def currentNamespace = env.ACTIVE_NAMESPACE
+                def previousNamespace = currentNamespace == BLUE_NAMESPACE ? GREEN_NAMESPACE : BLUE_NAMESPACE
+                sh "kubectl patch svc ${SERVICE_NAME} -p '{\"spec\":{\"selector\":{\"app\": \"react-node-app\",\"environment\": \"${previousNamespace}\"}}}' -n default"
+                echo "Rollback initiated. Switched traffic back to ${previousNamespace}."
+            }
+        }
+    }
+}

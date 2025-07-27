@@ -1,0 +1,14 @@
+# service-blue.yaml
+apiVersion: v1
+kind: Service
+metadata:
+  name: main-app-service
+spec:
+  type: LoadBalancer
+  selector:
+    app: react-node-app
+    track: blue
+  ports:
+  - protocol: TCP
+    port: 80
+    targetPort: 8000
