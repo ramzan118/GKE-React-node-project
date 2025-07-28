@@ -1,0 +1,5 @@
+{
+  "projectId": "gke-react-node-project",
+  "instanceId": "my-spanner-instance",
+  "databaseId": "my-react-node-db"
+}
