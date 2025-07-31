@@ -11,9 +11,9 @@ env:
   # --- GCP Configuration ---
   # IMPORTANT: Replace 'gke-react-node-spanner-project-ramzan' with your actual Project ID.
   # Update it in the workflow file and ensure it matches your gcloud config.
-  PROJECT_ID: 'gke-react-node-spanner-project-ramzan'
-  GKE_CLUSTER: 'gke-react-node-cluster'
-  GKE_ZONE: 'us-central1-a'
+  PROJECT_ID: 'gke-react-node-project' # Updated to your project ID
+  GKE_CLUSTER: 'my-new-standard-cluster' # Using your existing cluster name
+  GKE_ZONE: 'us-central1-c' # Updated to your cluster's specific zone
   ARTIFACT_REGISTRY_HOSTNAME: 'us-central1-docker.pkg.dev' # Or your region's Artifact Registry hostname (e.g., europe-west1-docker.pkg.dev)
   IMAGE_NAME: 'react-node-app' # Name of your Docker image in Artifact Registry
 
@@ -29,11 +29,11 @@ env:
   # IMPORTANT: The PROJECT_NUMBER must be the numerical ID, not the string ID.
   # Get it using: gcloud projects describe YOUR_PROJECT_ID --format='value(projectNumber)'
   # Hardcode it here as GitHub Actions cannot dynamically fetch it for the 'auth' action.
-  PROJECT_NUMBER: 'YOUR_GCP_PROJECT_NUMBER_HERE' # e.g., '123456789012'
+  PROJECT_NUMBER: '920645971709' # Updated to your actual project number
   WIF_POOL_ID: 'github-actions-pool'
   WIF_PROVIDER_ID: 'github-provider'
   # IMPORTANT: Replace 'gke-react-node-spanner-project-ramzan' with your actual Project ID.
-  GCP_SERVICE_ACCOUNT: 'github-actions-sa@gke-react-node-spanner-project-ramzan.iam.gserviceaccount.com'
+  GCP_SERVICE_ACCOUNT: 'github-actions-sa@gke-react-node-project.iam.gserviceaccount.com' # Updated to your project ID
 
 permissions:
   contents: 'read' # Required to checkout code
@@ -79,11 +79,11 @@ jobs:
           if [ "$CURRENT_SELECTOR" == "blue" ]; then
             echo "NEXT_DEPLOYMENT_VERSION=green" >> $GITHUB_ENV
             echo "CURRENT_ACTIVE_VERSION=blue" >> $GITHUB_ENV
-            echo "DEPLOYMENT_MANIFEST=k8s/deployment-green.yaml" >> $GITHUB_ENV
+            echo "DEPLOYMENT_MANIFEST=kubernetes/deployment-green.yaml" >> $GITHUB_ENV # Corrected path
           else
             echo "NEXT_DEPLOYMENT_VERSION=blue" >> $GITHUB_ENV
             echo "CURRENT_ACTIVE_VERSION=green" >> $GITHUB_ENV
-            echo "DEPLOYMENT_MANIFEST=k8s/deployment-blue.yaml" >> $GITHUB_ENV
+            echo "DEPLOYMENT_MANIFEST=kubernetes/deployment-blue.yaml" >> $GITHUB_ENV # Corrected path
           fi
           echo "Next deployment target: ${{ env.NEXT_DEPLOYMENT_VERSION }}"
 
@@ -141,7 +141,7 @@ jobs:
           echo "Shifting traffic to ${{ env.NEXT_DEPLOYMENT_VERSION }} environment..."
           kubectl patch service ${{ env.K8S_SERVICE_NAME }} -n ${{ env.K8S_NAMESPACE }} \
             -p '{"spec":{"selector":{"app":"${{ env.K8S_APP_NAME }}","version":"${{ env.NEXT_DEPLOYMENT_VERSION }}"}}}'
-          echo "Traffic successfully shifted to ${{ env.NEXT_DEPLOYMENT_VERSION }}."
+          echo "Traffic successfully shifted to ${{ env.K8S_APP_NAME }}-${{ env.NEXT_DEPLOYMENT_VERSION }}." # Corrected echo
 
       - name: Post-Deployment Verification
         run: |
@@ -153,10 +153,8 @@ jobs:
           sleep 10 # Simulate verification duration
           echo "Post-deployment verification complete."
 
-    # --- Instant Rollback & Cleanup ---
-    # This 'always' block ensures rollback and cleanup attempts happen regardless of job success/failure.
-    # The 'if' conditions within the steps will determine what actions are taken.
-    always:
+      # --- Instant Rollback & Cleanup Steps (now correctly placed under 'steps') ---
+      # These steps will run based on their individual 'if' conditions.
       - name: Rollback on Failure (if traffic was shifted)
         if: failure() && steps.shift_traffic.outcome == 'success'
         run: |
@@ -168,7 +166,6 @@ jobs:
           kubectl scale deployment ${{ env.K8S_APP_NAME }}-${{ env.NEXT_DEPLOYMENT_VERSION }} --replicas=0 -n ${{ env.K8S_NAMESPACE }}
 
       - name: Scale Down Old Deployment (on success or after rollback)
-        # This runs if the job succeeded OR if it failed AFTER shifting traffic and performed a rollback.
         if: success() || (failure() && steps.shift_traffic.outcome == 'success')
         run: |
           echo "Scaling down old inactive deployment (${{ env.CURRENT_ACTIVE_VERSION }})..."
