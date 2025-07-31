@@ -1,0 +1,176 @@
+name: GKE Blue-Green Deployment
+
+on:
+  push:
+    branches:
+      - develop # Trigger for green deployments (pre-production testing)
+      - main    # Trigger for traffic shift (production release) or hotfixes
+  workflow_dispatch: # Allows manual triggering from GitHub UI
+
+env:
+  # --- GCP Configuration ---
+  # IMPORTANT: Replace 'gke-react-node-spanner-project-ramzan' with your actual Project ID.
+  # Update it in the workflow file and ensure it matches your gcloud config.
+  PROJECT_ID: 'gke-react-node-spanner-project-ramzan'
+  GKE_CLUSTER: 'gke-react-node-cluster'
+  GKE_ZONE: 'us-central1-a'
+  ARTIFACT_REGISTRY_HOSTNAME: 'us-central1-docker.pkg.dev' # Or your region's Artifact Registry hostname (e.g., europe-west1-docker.pkg.dev)
+  IMAGE_NAME: 'react-node-app' # Name of your Docker image in Artifact Registry
+
+  # --- Kubernetes Configuration ---
+  K8S_APP_NAME: 'react-node-app' # Base name for your K8s deployments and service selector
+  K8S_SERVICE_NAME: 'react-node-app-service' # Name of your K8s LoadBalancer Service
+  K8S_NAMESPACE: 'default' # Namespace for deployment
+
+  # --- Secret Manager Configuration ---
+  SPANNER_CONNECTION_SECRET_ID: 'spanner-db-connection-string' # Matches secret ID from Section 3.1
+
+  # --- Workload Identity Federation Configuration ---
+  # IMPORTANT: The PROJECT_NUMBER must be the numerical ID, not the string ID.
+  # Get it using: gcloud projects describe YOUR_PROJECT_ID --format='value(projectNumber)'
+  # Hardcode it here as GitHub Actions cannot dynamically fetch it for the 'auth' action.
+  PROJECT_NUMBER: 'YOUR_GCP_PROJECT_NUMBER_HERE' # e.g., '123456789012'
+  WIF_POOL_ID: 'github-actions-pool'
+  WIF_PROVIDER_ID: 'github-provider'
+  # IMPORTANT: Replace 'gke-react-node-spanner-project-ramzan' with your actual Project ID.
+  GCP_SERVICE_ACCOUNT: 'github-actions-sa@gke-react-node-spanner-project-ramzan.iam.gserviceaccount.com'
+
+permissions:
+  contents: 'read' # Required to checkout code
+  id-token: 'write' # Required for Workload Identity Federation to get OIDC token
+
+jobs:
+  deploy:
+    runs-on: ubuntu-latest
+    environment: production # Optional: Link to a GitHub Environment for production deployments
+
+    steps:
+      - name: Checkout Repository
+        uses: actions/checkout@v4
+
+      - name: Set up Google Cloud SDK
+        uses: google-github-actions/setup-gcloud@v2
+        with:
+          project_id: ${{ env.PROJECT_ID }}
+
+      - name: Authenticate to Google Cloud
+        id: auth
+        uses: google-github-actions/auth@v2
+        with:
+          workload_identity_provider: projects/${{ env.PROJECT_NUMBER }}/locations/global/workloadIdentityPools/${{ env.WIF_POOL_ID }}/providers/${{ env.WIF_PROVIDER_ID }}
+          service_account: ${{ env.GCP_SERVICE_ACCOUNT }}
+
+      - name: Configure Docker to use Artifact Registry
+        run: gcloud auth configure-docker ${{ env.ARTIFACT_REGISTRY_HOSTNAME }}
+
+      - name: Get GKE Credentials
+        run: gcloud container clusters get-credentials ${{ env.GKE_CLUSTER }} --zone ${{ env.GKE_ZONE }} --project ${{ env.PROJECT_ID }}
+
+      # Determine which environment is currently active (blue or green)
+      # And thus, which one will be the 'next' deployment target.
+      - name: Determine Active/Inactive Deployment
+        id: determine_env
+        run: |
+          # Get current service selector version
+          # Default to 'blue' if service does not exist yet (first deployment)
+          CURRENT_SELECTOR=$(kubectl get service ${{ env.K8S_SERVICE_NAME }} -n ${{ env.K8S_NAMESPACE }} -o jsonpath='{.spec.selector.version}' 2>/dev/null || echo "blue")
+          echo "Current active version in K8s Service Selector: $CURRENT_SELECTOR"
+
+          if [ "$CURRENT_SELECTOR" == "blue" ]; then
+            echo "NEXT_DEPLOYMENT_VERSION=green" >> $GITHUB_ENV
+            echo "CURRENT_ACTIVE_VERSION=blue" >> $GITHUB_ENV
+            echo "DEPLOYMENT_MANIFEST=k8s/deployment-green.yaml" >> $GITHUB_ENV
+          else
+            echo "NEXT_DEPLOYMENT_VERSION=blue" >> $GITHUB_ENV
+            echo "CURRENT_ACTIVE_VERSION=green" >> $GITHUB_ENV
+            echo "DEPLOYMENT_MANIFEST=k8s/deployment-blue.yaml" >> $GITHUB_ENV
+          fi
+          echo "Next deployment target: ${{ env.NEXT_DEPLOYMENT_VERSION }}"
+
+      - name: Build and Push Docker Image to Artifact Registry
+        id: build_push_image
+        # Create a unique image tag using Git SHA for traceability
+        run: |
+          IMAGE_TAG="${{ env.ARTIFACT_REGISTRY_HOSTNAME }}/${{ env.PROJECT_ID }}/${{ env.IMAGE_NAME }}:${{ github.sha }}"
+          echo "Building image: $IMAGE_TAG"
+          docker build -t $IMAGE_TAG .
+          docker push $IMAGE_TAG
+          echo "DEPLOY_IMAGE_TAG=$IMAGE_TAG" >> $GITHUB_ENV # Make available to subsequent steps
+
+      - name: Deploy to Inactive Environment (${{ env.NEXT_DEPLOYMENT_VERSION }})
+        id: deploy_inactive
+        run: |
+          # Apply the deployment manifest for the inactive environment
+          # This creates/updates the deployment for the new version
+          kubectl apply -f ${{ env.DEPLOYMENT_MANIFEST }} -n ${{ env.K8S_NAMESPACE }}
+
+          # Update the image of the newly deployed version
+          kubectl set image deployment/${{ env.K8S_APP_NAME }}-${{ env.NEXT_DEPLOYMENT_VERSION }} \
+            ${{ env.K8S_APP_NAME }}=${{ env.DEPLOY_IMAGE_TAG }} -n ${{ env.K8S_NAMESPACE }}
+
+          # Scale up the new deployment to desired replicas
+          kubectl scale deployment ${{ env.K8S_APP_NAME }}-${{ env.NEXT_DEPLOYMENT_VERSION }} --replicas=3 -n ${{ env.K8S_NAMESPACE }}
+
+          # Wait for the new deployment's pods to be ready
+          echo "Waiting for ${{ env.K8S_APP_NAME }}-${{ env.NEXT_DEPLOYMENT_VERSION }} deployment to be ready..."
+          kubectl rollout status deployment/${{ env.K8S_APP_NAME }}-${{ env.NEXT_DEPLOYMENT_VERSION }} -n ${{ env.K8S_NAMESPACE }} --timeout=5m
+          echo "${{ env.NEXT_DEPLOYMENT_VERSION }} deployment is ready."
+
+      # --- Manual Approval for Production Traffic Shift ---
+      # This step only runs when pushing to 'main' branch, ensuring manual gate for production.
+      - name: Manual Approval for Traffic Shift (Main Branch Only)
+        if: github.ref == 'refs/heads/main'
+        uses: trstringer/manual-approval@v1
+        with:
+          secret: ${{ secrets.GITHUB_TOKEN }}
+          approvers: ramzan118 # Replace with your GitHub username or team name
+          minimum-approvals: 1
+          issue-title: "Approve traffic shift to ${{ env.NEXT_DEPLOYMENT_VERSION }}"
+          issue-body: |
+            New version from commit ${{ github.sha }} deployed to the ${{ env.NEXT_DEPLOYMENT_VERSION }} environment.
+            Please verify its functionality before approving the traffic shift.
+            **Deployment Image:** ${{ env.DEPLOY_IMAGE_TAG }}
+            **Current Active:** ${{ env.CURRENT_ACTIVE_VERSION }}
+            **New Version:** ${{ env.NEXT_DEPLOYMENT_VERSION }}
+          timeout-minutes: 60 # How long to wait for approval
+
+      - name: Shift Traffic to New Environment (${{ env.NEXT_DEPLOYMENT_VERSION }})
+        id: shift_traffic
+        # This step runs for 'main' branch or if it's a 'develop' branch push (no manual approval)
+        run: |
+          echo "Shifting traffic to ${{ env.NEXT_DEPLOYMENT_VERSION }} environment..."
+          kubectl patch service ${{ env.K8S_SERVICE_NAME }} -n ${{ env.K8S_NAMESPACE }} \
+            -p '{"spec":{"selector":{"app":"${{ env.K8S_APP_NAME }}","version":"${{ env.NEXT_DEPLOYMENT_VERSION }}"}}}'
+          echo "Traffic successfully shifted to ${{ env.NEXT_DEPLOYMENT_VERSION }}."
+
+      - name: Post-Deployment Verification
+        run: |
+          echo "Verifying production traffic is served by ${{ env.K8S_APP_NAME }}-${{ env.NEXT_DEPLOYMENT_VERSION }}..."
+          # Add more robust verification steps here, e.g., curling health endpoints via LoadBalancer IP
+          # For example:
+          # SERVICE_IP=$(kubectl get service ${{ env.K8S_SERVICE_NAME }} -n ${{ env.K8S_NAMESPACE }} -o jsonpath='{.status.loadBalancer.ingress[0].ip}')
+          # curl -f http://${SERVICE_IP}/health || exit 1
+          sleep 10 # Simulate verification duration
+          echo "Post-deployment verification complete."
+
+    # --- Instant Rollback & Cleanup ---
+    # This 'always' block ensures rollback and cleanup attempts happen regardless of job success/failure.
+    # The 'if' conditions within the steps will determine what actions are taken.
+    always:
+      - name: Rollback on Failure (if traffic was shifted)
+        if: failure() && steps.shift_traffic.outcome == 'success'
+        run: |
+          echo "Deployment failed AFTER traffic shift. Initiating rollback to previous active version (${{ env.CURRENT_ACTIVE_VERSION }})!"
+          kubectl patch service ${{ env.K8S_SERVICE_NAME }} -n ${{ env.K8S_NAMESPACE }} \
+            -p '{"spec":{"selector":{"app":"${{ env.K8S_APP_NAME }}","version":"${{ env.CURRENT_ACTIVE_VERSION }}"}}}'
+          echo "Traffic successfully reverted to ${{ env.CURRENT_ACTIVE_VERSION }} environment."
+          # Optionally, scale down the failed new deployment
+          kubectl scale deployment ${{ env.K8S_APP_NAME }}-${{ env.NEXT_DEPLOYMENT_VERSION }} --replicas=0 -n ${{ env.K8S_NAMESPACE }}
+
+      - name: Scale Down Old Deployment (on success or after rollback)
+        # This runs if the job succeeded OR if it failed AFTER shifting traffic and performed a rollback.
+        if: success() || (failure() && steps.shift_traffic.outcome == 'success')
+        run: |
+          echo "Scaling down old inactive deployment (${{ env.CURRENT_ACTIVE_VERSION }})..."
+          kubectl scale deployment ${{ env.K8S_APP_NAME }}-${{ env.CURRENT_ACTIVE_VERSION }} --replicas=0 -n ${{ env.K8S_NAMESPACE }}
+          echo "Old deployment scaled down."

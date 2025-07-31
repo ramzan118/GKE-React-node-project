@@ -1,0 +1,44 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: react-node-app-green
+  labels:
+    app: react-node-app
+    version: green
+spec:
+  replicas: 3
+  selector:
+    matchLabels:
+      app: react-node-app
+      version: green
+  template:
+    metadata:
+      labels:
+        app: react-node-app
+        version: green
+    spec:
+      serviceAccountName: spanner-app-ksa
+      containers:
+        - name: react-node-app
+          image: gcr.io/${PROJECT_ID}/react-node-app:green
+          ports:
+            - containerPort: 8080
+          env:
+            - name: PORT
+              value: "8080"
+            - name: GCP_PROJECT_ID
+              value: "${PROJECT_ID}"
+            - name: SPANNER_CONNECTION_STRING_SECRET_ID
+              value: "spanner-db-connection-string"
+          livenessProbe:
+            httpGet:
+              path: /health
+              port: 8080
+            initialDelaySeconds: 30
+            periodSeconds: 10
+          readinessProbe:
+            httpGet:
+              path: /health
+              port: 8080
+            initialDelaySeconds: 30
+            periodSeconds: 10

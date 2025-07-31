@@ -1,0 +1,15 @@
+apiVersion: v1
+kind: Service
+metadata:
+  name: react-node-app-service
+  labels:
+    app: react-node-app
+spec:
+  type: LoadBalancer # Exposes the service externally via a GCP Load Balancer
+  ports:
+    - protocol: TCP
+      port: 80        # External port
+      targetPort: 8080 # Container port
+  selector:
+    app: react-node-app
+    version: blue # Initially points to the blue deployment

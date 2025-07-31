@@ -1,0 +1,44 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: react-node-app-blue
+  labels:
+    app: react-node-app
+    version: blue
+spec:
+  replicas: 3 # Adjust as needed
+  selector:
+    matchLabels:
+      app: react-node-app
+      version: blue
+  template:
+    metadata:
+      labels:
+        app: react-node-app
+        version: blue
+    spec:
+      serviceAccountName: spanner-app-ksa # Kubernetes Service Account for Spanner access
+      containers:
+        - name: react-node-app
+          image: gcr.io/${PROJECT_ID}/react-node-app:blue # Image will be updated by pipeline
+          ports:
+            - containerPort: 8080
+          env:
+            - name: PORT
+              value: "8080"
+            - name: GCP_PROJECT_ID
+              value: "${PROJECT_ID}"
+            - name: SPANNER_CONNECTION_STRING_SECRET_ID
+              value: "spanner-db-connection-string" # Matches secret ID from Section 3.1
+          livenessProbe:
+            httpGet:
+              path: /health # Your app should expose a /health endpoint
+              port: 8080
+            initialDelaySeconds: 30
+            periodSeconds: 10
+          readinessProbe:
+            httpGet:
+              path: /health
+              port: 8080
+            initialDelaySeconds: 30
+            periodSeconds: 10
